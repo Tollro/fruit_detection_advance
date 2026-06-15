@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from ultralytics.nn.modules.conv import DCNv2
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1817,6 +1818,8 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            # 新增可变性卷积
+            DCNv2,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments

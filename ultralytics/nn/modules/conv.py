@@ -8,6 +8,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision
 
 __all__ = (
     "CBAM",
@@ -667,3 +668,60 @@ class Index(nn.Module):
             (torch.Tensor): Selected tensor.
         """
         return x[self.index]
+
+# ----------------------------------------- #
+# 新增：Deformable Convolution v2 模块，包含偏移和调制权重的预测 --- IGNORE #
+class DCNv2(nn.Module):
+    """Deformable Convolution v2 with modulated deformable convolution."""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, groups=1, deformable_groups=1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        self.stride = (stride, stride) if isinstance(stride, int) else stride
+        self.padding = (padding, padding) if isinstance(padding, int) else padding
+        self.dilation = (dilation, dilation) if isinstance(dilation, int) else dilation
+        self.groups = groups
+        self.deformable_groups = deformable_groups
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels // groups, *self.kernel_size)
+        )
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        # 用于预测偏移和调制权重的卷积层
+        self.conv_offset = nn.Conv2d(
+            in_channels,
+            deformable_groups * 3 * self.kernel_size[0] * self.kernel_size[1],
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=True,
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+        nn.init.constant_(self.conv_offset.weight, 0.)
+        nn.init.constant_(self.conv_offset.bias, 0.)
+
+    def forward(self, x):
+        offset_mask = self.conv_offset(x)
+        o1, o2, mask = torch.chunk(offset_mask, 3, dim=1)
+        offset = torch.cat((o1, o2), dim=1)
+        mask = torch.sigmoid(mask)
+        return torchvision.ops.deform_conv2d(
+            x,
+            offset,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            mask=mask,
+        )

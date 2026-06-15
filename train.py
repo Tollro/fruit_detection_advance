@@ -10,7 +10,8 @@ if __name__ == '__main__':
     # model.load("yolo11n.pt", strict=False)
 
     # 2. 加载官方预训练权重到 CPU
-    ckpt = torch.load("yolo11n.pt", map_location="cpu", weights_only=False)
+    # ckpt = torch.load("yolo11n.pt", map_location="cpu", weights_only=False)
+    ckpt = torch.load("runs/detect/embed/exp1/weights/best.pt", map_location="cpu", weights_only=False)  
 
     # 3. 提取模型权重（Ultralytics checkpoint 的 "model" 键保存了状态字典）
     ckpt_model = ckpt["model"]                                   # 可能是整个模型对象
@@ -32,16 +33,14 @@ if __name__ == '__main__':
         epochs=170,          # 总训练轮次
         # patience=80,         # 早停，连续50轮无提升则停止
         imgsz=640,           # 输入图像尺寸
-        batch=24,            # 手动设置批次大小
+        batch=32,            # 手动设置批次大小
         device=0,            # GPU设备号
         workers=4,           # 数据加载进程数
-        project='fruit_detect_v1_embed',
+        project='embed_DCNv2',
         name='exp1',
         # 数据增强参数 (示例：略微调整HSV增强)
         hsv_h=0.02,
         hsv_s=0.6,
         hsv_v=0.4,
         fliplr=0.5,
-        # mosaic=1.0,        # 默认为1.0，可注释掉
-        # close_mosaic=10,   # 最后10轮关闭马赛克增强，防止波动'
     )
