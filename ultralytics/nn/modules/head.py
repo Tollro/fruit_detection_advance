@@ -86,7 +86,7 @@ class Detect(nn.Module):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
     xyxy = False  # xyxy or xywh output
 
-    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = (), embed_dim=64):
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = (), embed_dim=64, num_prototypes=2):
         """Initialize the YOLO detection layer with specified number of classes and channels.
 
         Args:
@@ -96,25 +96,32 @@ class Detect(nn.Module):
             ch (tuple): Tuple of channel sizes from backbone feature maps.
             新增：
             embed_dim (int): Dimension of the embedding layer.
+            num_prototypes (int): 每个类别的子原型数量 (例如 2 代表完整和切开)
         """
         super().__init__()
         self.nc = nc  # number of classes
+        self.num_prototypes = num_prototypes # [新增] 子原型数量
+        self.nc_out = nc * num_prototypes    # [新增] 分类头实际输出通道数
+
         self.nl = len(ch)  # number of detection layers
         self.reg_max = reg_max  # DFL channels
-        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        # self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        # [修改] 这里的 self.no 需要用 nc_out 而不是 nc
+        self.no = self.nc_out + self.reg_max * 4
+
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         self.cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
         self.cv3 = (
-            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc_out, 1)) for x in ch)
             if self.legacy
             else nn.ModuleList(
                 nn.Sequential(
                     nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
                     nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                    nn.Conv2d(c3, self.nc, 1),
+                    nn.Conv2d(c3, self.nc_out, 1),
                 )
                 for x in ch
             )
@@ -163,7 +170,9 @@ class Detect(nn.Module):
             return dict()
         bs = x[0].shape[0]  # batch size
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
-        scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        # scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        # [修改] view的维度从 self.nc 改为 self.nc_out
+        scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc_out, -1) for i in range(self.nl)], dim=-1)
         return dict(boxes=boxes, scores=scores, feats=x)
 
     def forward(
@@ -205,7 +214,13 @@ class Detect(nn.Module):
         """
         # Inference path
         dbox = self._get_decode_boxes(x)
-        return torch.cat((dbox, x["scores"].sigmoid()), 1)
+        # return torch.cat((dbox, x["scores"].sigmoid()), 1)
+        # [修改] 推理时合并多个原型的分数。把形状从 (bs, nc*K, anchors) 变回 (bs, nc, anchors)
+        bs, _, anchors_num = x["scores"].shape
+        # 将通道拆分为 nc 和 num_prototypes，然后在 num_prototypes 维度上取最大值 (即每个类的最优原型)
+        merged_scores = x["scores"].view(bs, self.nc, self.num_prototypes, anchors_num).max(dim=2)[0]
+        # [修改] 使用合并后的 merged_scores 进行 sigmoid
+        return torch.cat((dbox, merged_scores.sigmoid()), 1)
 
     def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get decoded boxes based on anchors and strides."""
@@ -221,13 +236,17 @@ class Detect(nn.Module):
         """Initialize Detect() biases, WARNING: requires stride availability."""
         for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):  # from
             a[-1].bias.data[:] = 2.0  # box
-            b[-1].bias.data[: self.nc] = math.log(
+            # b[-1].bias.data[: self.nc] = math.log(
+            #     5 / self.nc / (640 / self.stride[i]) ** 2
+            # )  # cls (.01 objects, 80 classes, 640 img)
+            # [修改] 初始化所有的分类偏置，使用 self.nc_out
+            b[-1].bias.data[: self.nc_out] = math.log(
                 5 / self.nc / (640 / self.stride[i]) ** 2
-            )  # cls (.01 objects, 80 classes, 640 img)
+            )
         if self.end2end:
             for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
                 a[-1].bias.data[:] = 2.0  # box
-                b[-1].bias.data[: self.nc] = math.log(
+                b[-1].bias.data[: self.nc_out] = math.log(
                     5 / self.nc / (640 / self.stride[i]) ** 2
                 )  # cls (.01 objects, 80 classes, 640 img)
 

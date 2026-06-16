@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from ultralytics.nn.modules.block import C3k2_DCN
 from ultralytics.nn.modules.conv import DCNv2
 
 from ultralytics.nn.autobackend import check_class_names
@@ -37,6 +38,7 @@ from ultralytics.nn.modules import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    # C3k2_DCN,
     C3x,
     CBFuse,
     CBLinear,
@@ -1758,7 +1760,7 @@ def parse_model(d, ch, verbose=True):
     import ast
 
     # Args
-    legacy = True  # backward compatibility for v3/v5/v8/v9 models
+    legacy = d.get("legacy", True)  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
     nc, act, scales, end2end = (d.get(x) for x in ("nc", "activation", "scales", "end2end"))
     reg_max = d.get("reg_max", 16)
@@ -1820,6 +1822,7 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
             # 新增可变性卷积
             DCNv2,
+            C3k2_DCN,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1839,6 +1842,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
+            C3k2_DCN,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1921,23 +1925,31 @@ def parse_model(d, ch, verbose=True):
                 Pose, Pose26, OBB, OBB26,
             }
         ):
-            # 原始 args 可能是 [nc] 或 [nc, embed_dim]
-            # 1. 取出 nc 和可能存在的额外参数
-            extra_args = args[1:]        # 例如 (embed_dim,) 或为空
-            args = [args[0]]            # 只保留 nc
-
-            # 2. 按原始顺序追加 reg_max, end2end, ch
-            args.extend([reg_max, end2end, [ch[x] for x in f]])
-
-            # 3. 追加用户在 yaml 中写的额外参数（如 embed_dim）
-            args.extend(extra_args)
-
-            # 原有特殊处理保持不变
-            if m in {Segment, YOLOESegment, Segment26, YOLOESegment26}:
-                args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+            # ----------------- [彻底修复后的精细拦截逻辑] -----------------
+            if m is Detect:
+                # 1. 提取我们在 YAML 中传入的参数 [nc, 64, 2]
+                yaml_nc = args[0]
+                yaml_embed_dim = args[1] if len(args) > 1 else 64
+                yaml_num_proto = args[2] if len(args) > 2 else 2  # 默认 2 个原型
+                
+                # 2. 读取模型全局配置和输入通道
+                reg_max = d.get('reg_max', 16)
+                end2end = d.get('end2end', False)
+                c_layers = [ch[x] for x in f]  # 提取输入特征图的通道数列表
+                
+                # 3. 【核心】严格按照你修改后的 Detect.__init__ 签名顺序重组 args：
+                # 你的签名顺序是: (nc, reg_max, end2end, ch, embed_dim, num_prototypes)
+                args = [yaml_nc, reg_max, end2end, c_layers, yaml_embed_dim, yaml_num_proto]
+            else:
+                # 4. 其他类型的 Head（如 Segment/Pose/OBB）完美恢复成原版官方逻辑，绝对互不干扰
+                args.extend([reg_max, end2end, [ch[x] for x in f]])
+                if m in {Segment, YOLOESegment, Segment26, YOLOESegment26}:
+                    args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+            
+            # 5. 原官方共有的 legacy 标志赋值
             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
-        # ----------------------------------------- #
+            # --------------------------- [结束] ---------------------------
         elif m is SemanticSegment:
             args.append([ch[x] for x in f])  # nc, ch tuple
         elif m is v10Detect:

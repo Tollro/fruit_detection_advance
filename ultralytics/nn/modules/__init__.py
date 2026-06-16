@@ -43,6 +43,7 @@ from .block import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    C3k2_DCN,
     C3x,
     CBFuse,
     CBLinear,
@@ -189,4 +190,5 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "C3k2_DCN",##
 )

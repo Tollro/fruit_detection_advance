@@ -356,11 +356,19 @@ class v8DetectionLoss:
         # 新增嵌入损失设置：如果 embed_loss_weight > 0 则启用嵌入损失，并根据模型配置获取 embed_dim
         self.end2end = m.end2end   # 添加这一行
         self.embed_dim = getattr(m, 'embed_dim', 0)
-        self.embed_loss_weight = embed_loss_weight
+        self.num_prototypes = getattr(m, 'num_prototypes', 1) # [新增]
+
+        # ----------------- [新增：初始化你的自定义损失参数] -----------------
+        # 1. 从最后一层检测头（m）中安全获取你传入的 embed_dim
+        self.embed_dim = getattr(m, "embed_dim", 0)
+        # 2. 获取你的自定义损失权重（优先从训练参数 h 中取，取不到则默认设为 1.0）
+        self.embed_loss_weight = getattr(h, "embed_loss_weight", 1.0)
+        # -----------------------------------------------------------------
         
         if self.embed_loss_weight > 0 and self.embed_dim > 0:
             # 每个类别一个可学习的中心向量
-            self.centers = nn.Parameter(torch.randn(self.nc, self.embed_dim, device=device))
+            # # [修改] 每个类别的每个子原型都有一个可学习的中心向量，形状变为 (nc, K, embed_dim)
+            self.centers = nn.Parameter(torch.randn(self.nc, self.num_prototypes, self.embed_dim, device=device))
         else:
             self.centers = None
         # ----------------------------------------------------- #
@@ -413,6 +421,7 @@ class v8DetectionLoss:
         target indices.
         """
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        # 这里 pred_scores 的原始形状是 (bs, num_anchors, nc * K)
         pred_distri, pred_scores = (
             preds["boxes"].permute(0, 2, 1).contiguous(),
             preds["scores"].permute(0, 2, 1).contiguous(),
@@ -432,8 +441,14 @@ class v8DetectionLoss:
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
+        # ------------------------------------------------------- #
+        # [关键修改 1] 为了兼容 TAL 分配器，需将预测分数在原型维度取 Max，降维回 (bs, num_anchors, nc)
+        pred_scores_reshaped = pred_scores.view(batch_size, -1, self.nc, self.num_prototypes)
+        pred_scores_for_assigner = pred_scores_reshaped.max(dim=-1)[0]
+        # ------------------------------------------------------- #
+
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
-            pred_scores.detach().sigmoid(),
+            pred_scores_for_assigner.detach().sigmoid(), # [修改] 传入融合后的分数
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
             gt_labels,
@@ -443,11 +458,36 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss with optional class weighting
-        bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
+        # ------------------------------------------------------- #
+        # [关键修改 2] 动态原型标签分配与分类损失计算
+        # 找出当前每个网格、每个类别中，哪一个原型的预测 logits 最高 (赢家通吃)
+        best_proto_idx = pred_scores_reshaped.argmax(dim=-1)  # (bs, num_anchors, nc)
+        
+        # 构造扩展版的目标张量 (bs, num_anchors, nc, K)
+        target_scores_expanded = torch.zeros_like(pred_scores_reshaped)
+        # 将原版 TAL 分配的 target_scores 仅填充给赢家原型，其余原型目标保持为 0（即作为背景惩罚）
+        # 【修复：显式使用 .to() 转换 src 的类型，兼容 AMP 混合精度】
+        target_scores_expanded.scatter_(
+            dim=-1, 
+            index=best_proto_idx.unsqueeze(-1), 
+            src=target_scores.unsqueeze(-1).to(pred_scores_reshaped.dtype)
+        )
+        
+        # 计算扩展后的二分类交叉熵损失
+        bce_loss = self.bce(pred_scores_reshaped, target_scores_expanded)  # (bs, num_anchors, nc, K)
+        
         if self.class_weights is not None:
-            bce_loss *= self.class_weights
+            # class_weights 形状为 (1, 1, nc)，需扩展最后一维以匹配 K
+            bce_loss *= self.class_weights.unsqueeze(-1)
+            
         loss[1] = bce_loss.sum() / target_scores_sum  # BCE
+        # ------------------------------------------------------- #
+
+        # # Cls loss with optional class weighting
+        # bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
+        # if self.class_weights is not None:
+        #     bce_loss *= self.class_weights
+        # loss[1] = bce_loss.sum() / target_scores_sum  # BCE
 
         # Bbox loss
         if fg_mask.sum():
@@ -473,8 +513,9 @@ class v8DetectionLoss:
         # )  # loss(box, cls, dfl)
 
         # ------------------------------------------------------- #
+        # [修改] 将 best_proto_idx 传出去给度量学习损失使用
         return (
-            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor, target_scores),
+            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor, target_scores, best_proto_idx),
             loss,
             loss.detach(),
         )
@@ -505,8 +546,8 @@ class v8DetectionLoss:
             preds_main = preds["one2many"]
         else:
             preds_main = preds
-        
-        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor, target_scores), loss, loss_detach = \
+        # [修改] 接收传出来的 best_proto_idx
+        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor, target_scores, best_proto_idx), loss, loss_detach = \
             self.get_assigned_targets_and_loss(preds_main, batch)
 
         if self.centers is not None and "embeddings" in preds_main and fg_mask.sum() > 0:
@@ -520,9 +561,14 @@ class v8DetectionLoss:
             pos_scores = target_scores[pos_mask]  # (num_pos, nc)
             pos_labels = pos_scores.argmax(dim=1)  # (num_pos,)
             
+            # 提取出正样本区域对应的预测赢家原型索引
+            pos_best_proto = best_proto_idx[pos_mask]  # (num_pos, nc)
+            # 取得真实类别对应的那个赢家原型索引 (num_pos,)
+            pos_proto_labels = pos_best_proto.gather(1, pos_labels.unsqueeze(-1)).squeeze(-1)
+
             # Center Loss
-            centers_batch = self.centers[pos_labels]  # (num_pos, embed_dim)
-            embed_loss = F.mse_loss(pos_embeddings, centers_batch)  # 简单用 MSE 拉近
+            centers_batch = self.centers[pos_labels, pos_proto_labels]  # (num_pos, embed_dim)
+            embed_loss = torch.nn.functional.mse_loss(pos_embeddings, centers_batch)  # 简单用 MSE 拉近
             loss += self.embed_loss_weight * embed_loss
             # loss_detach = torch.cat((loss_detach, embed_loss.detach().unsqueeze(0)))
         # ------------------------------------------------------ #
