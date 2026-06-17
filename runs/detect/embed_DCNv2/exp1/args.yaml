@@ -5,17 +5,17 @@ data: fruit_detect.yaml
 epochs: 170
 time: null
 patience: 100
-batch: 32
+batch: 24
 imgsz: 640
 save: true
 save_period: -1
 cache: false
 device: '0'
 workers: 4
-project: embed_DCNv2
-name: exp1
+project: null
+name: train-2
 exist_ok: false
-pretrained: true
+pretrained: runs/detect/embed_DCNv2/exp1/weights/last.pt
 optimizer: auto
 verbose: true
 seed: 0
@@ -24,7 +24,7 @@ single_cls: false
 rect: false
 cos_lr: false
 close_mosaic: 10
-resume: false
+resume: null
 amp: true
 fraction: 1.0
 profile: false
@@ -107,4 +107,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: botsort.yaml
-save_dir: D:\Git\my_respositories\yolo_train_advance\runs\detect\embed_DCNv2\exp1
+save_dir: D:\Git\my_respositories\yolo_train_advance\runs\detect\train-2
